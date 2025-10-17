@@ -1,0 +1,23 @@
+# Ignore dataset CSVs (large files)
+animes.csv
+ratings.csv
+
+# Python related
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Environment / dependency files
+env/
+venv/
+ENV/
+venv.bak/
+
+# VSCode
+.vscode/
+
+# macOS
+.DS_Store
