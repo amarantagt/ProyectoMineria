@@ -2,6 +2,7 @@
 animes.csv
 ratings.csv
 dataset_completo.csv
+outputs
 
 # Python related
 __pycache__/
