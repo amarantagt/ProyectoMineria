@@ -2,7 +2,13 @@
 animes.csv
 ratings.csv
 dataset_completo.csv
+dataset_completo_limpio.csv
 outputs
+dataset_api_final_filtrado.csv
+dataset_api_final.csv
+dataset_api_limpio.csv
+dataset_final_con_generos_limpios.csv
+
 
 # Python related
 __pycache__/
