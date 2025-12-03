@@ -138,3 +138,36 @@ print(f"F1-Score (Micro): {f1_micro:.4f}")
 print(f"F1-Score (Macro): {f1_macro:.4f}")
 print(f"Subset Accuracy: {subset_acc:.4f}")
 print(f"Hamming Loss: {ham_loss:.4f}")
+
+def predecir_generos(sinopsis, mean_api_val=0, num_episodes_val=0):
+    # --- 1. Preparar el texto ---
+    inputs = tokenizer(
+        [sinopsis],
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=128
+    )
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    # --- 2. Obtener embedding BERT ---
+    with torch.no_grad():
+        outputs = model(**inputs)
+    texto_emb = outputs.last_hidden_state[:, 0, :].cpu().numpy()  # (1, 768)
+    # --- 3. Preparar features numéricas ---
+    # Recuerda: scaler ya está FITTEADO con el dataset original
+    numeric_vector = scaler.transform([[mean_api_val, num_episodes_val]])  # (1,2)
+    # --- 4. Concatenar para crear el feature vector final ---
+    X_final = np.hstack([texto_emb, numeric_vector])  # (1, 770)
+    # --- 5. Hacer predicción ---
+    pred = ovr_classifier.predict(X_final)[0]  # array de 0/1
+    # --- 6. Convertir el vector binario a nombres de géneros ---
+    generos_predichos = [genre_cols[i] for i, val in enumerate(pred) if val == 1]
+    return generos_predichos
+
+sinopsis_ejemplo = "a year after escaping sword art online, kazuto kirigaya has been settling back into the real world. however, his peace is short-lived as a new incident occurs in a game called gun gale online, where a player by the name of death gun appears to be killing people in the real world by shooting them in-game. approached by officials to assist in investigating the murders, kazuto assumes his persona of kirito once again and logs into gun gale online, intent on stopping the killer. once inside, kirito meets sinon, a highly skilled sniper afflicted by a traumatic past. she is soon dragged in his chase after death gun, and together they enter the bullet of bullets, a tournament where their target is sure to appear. uncertain of death gun's real powers, kirito and sinon race to stop him before he has the chance to claim another life. not everything goes smoothly, however, as scars from the past impede their progress. in a high-stakes game where the next victim could easily be one of them, kirito puts his life on the line in the virtual world once more."
+generos = predecir_generos(
+    sinopsis_ejemplo,
+    mean_api_val=0,            # si no quieres usar numéricas, deja 0
+    num_episodes_val=0
+)
+print("Géneros predichos:", generos)
