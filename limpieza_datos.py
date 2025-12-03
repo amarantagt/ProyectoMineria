@@ -60,5 +60,3 @@ df["synopsis_api"] = df["synopsis_api"].apply(normalizar_texto)
 # 5. Guardar resultado final
 # ================================
 df.to_csv("dataset_api_limpio.csv", index=False)
-
-print("✔ Limpieza completa realizada. Archivo guardado como 'dataset_completo_limpio_sinopsis_limpia.csv'")

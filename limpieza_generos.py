@@ -10,9 +10,6 @@ genre_cols = [c for c in df.columns if c not in ["animeID","title","mean_api","n
 
 empty_genres = [c for c in genre_cols if df[c].sum() == 0]
 df = df.drop(columns=empty_genres)
-
-
-
 df.to_csv("dataset_api_final.csv", index=False)
 
 #Veamos si hay desbalance
