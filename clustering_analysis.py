@@ -18,11 +18,13 @@ from ast import literal_eval  # para evaluar cadenas que contienen listas litera
 
 import numpy as np
 import pandas as pd
+import time
 # Importamos utilidades de scikit-learn para preprocesamiento, reducción y clustering
 from sklearn.preprocessing import StandardScaler, MultiLabelBinarizer
 from sklearn.decomposition import PCA
 from sklearn.cluster import KMeans, AgglomerativeClustering, DBSCAN
 from sklearn.metrics import silhouette_score, davies_bouldin_score
+from sklearn.feature_extraction.text import TfidfVectorizer
 
 # Configuración básica del logger para imprimir progreso
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
@@ -127,9 +129,10 @@ def load_and_merge(animes_path='animes.csv', dataset_path='dataset_completo.csv'
             logging.warning('No se pudo leer header de ratings.csv: %s', e)
             cols = None
 
-        # Posibles nombres para las columnas de anime id y rating (heurísticas)
-        anime_col_candidates = ['anime_id','animeID','animeId','animeID','animeid','anime']
-        rating_col_candidates = ['rating','score','rating_score']
+        # En nuestros datasets la columna identificadora es `animeID`, la usamos directamente.
+        # Para la columna de rating en `ratings.csv` esperamos el rating individual que da
+        # un usuario ('rating'). Como fallback usamos 'score' si el CSV tuviera otro nombre.
+        rating_col_candidates = ['rating', 'score']
 
         # Leer por chunks para ahorrar memoria
         reader = pd.read_csv(ratings_path, chunksize=200000)
@@ -138,14 +141,11 @@ def load_and_merge(animes_path='animes.csv', dataset_path='dataset_completo.csv'
         for chunk in reader:
             if cols is None:
                 cols = list(chunk.columns)
-            # Detectar columna que parece contener el id del anime
-            anime_col = None
-            for c in anime_col_candidates:
-                if c in chunk.columns:
-                    anime_col = c
-                    break
-            if anime_col is None:
-                # Heurística: usar la segunda columna si no encontramos candidata
+            # Preferimos la columna explícita 'animeID' en los chunks.
+            if 'animeID' in chunk.columns:
+                anime_col = 'animeID'
+            else:
+                # Fallback heurístico: tomar la segunda columna si no existe 'animeID'
                 anime_col = chunk.columns[1]
 
             # Detectar columna con rating
@@ -188,7 +188,7 @@ def load_and_merge(animes_path='animes.csv', dataset_path='dataset_completo.csv'
 
 # ------------------ PREPROCESAMIENTO Y FEATURES ------------------
 
-def preprocess_and_features(df):
+def preprocess_and_features(df, tfidf_max_features=0):
     """Genera columnas y features a partir del DataFrame unido.
 
     - Extrae `primary_genre`.
@@ -280,6 +280,22 @@ def preprocess_and_features(df):
         except Exception:
             logging.info('No se pudieron aplicar MultiLabelBinarizer a `genres`.')
 
+    # ---------------- TF-IDF EN SINOPSIS (opcional) ----------------
+    # Si el usuario pide tfidf_max_features>0 y existe la columna `synopsis_api`,
+    # transformamos el texto en features numéricas usando TF-IDF y las añadimos al df.
+    if tfidf_max_features and 'synopsis_api' in df.columns:
+        logging.info('Transformando sinopsis con TF-IDF (max_features=%d). Esto puede incrementar mucho el uso de memoria.', tfidf_max_features)
+        df['synopsis_api'] = df['synopsis_api'].fillna('')
+        tfidf = TfidfVectorizer(stop_words='english', max_features=tfidf_max_features)
+        synopsis_features = tfidf.fit_transform(df['synopsis_api'])
+        feature_names = [f'syn_tf_{w}' for w in tfidf.get_feature_names_out()]
+        # Convertir a DataFrame denso — atención al uso de memoria
+        synopsis_df = pd.DataFrame(synopsis_features.toarray(), columns=feature_names, index=df.index)
+        df = pd.concat([df, synopsis_df], axis=1)
+        logging.info('Añadidos %d features de sinopsis (TF-IDF).', len(feature_names))
+    else:
+        feature_names = []
+
     # SELECCIÓN DE FEATURES que usaremos para clustering (puedes modificar esta lista)
     feature_cols = ['score_num','episodes_num','year_num','rating_count','rating_mean','rating_std']
     # Añadir columnas one-hot de tipo
@@ -293,6 +309,10 @@ def preprocess_and_features(df):
         else:
             keep = genre_cols
         feature_cols += keep
+
+    # Incluir features de TF-IDF si se generaron
+    if feature_names:
+        feature_cols += feature_names
 
     # Filtrar sólo las columnas que realmente existen en df
     feature_cols = [c for c in feature_cols if c in df.columns]
@@ -309,7 +329,7 @@ def preprocess_and_features(df):
 
 # ------------------ CLUSTERING Y EVALUACIÓN ------------------
 
-def run_clustering_and_evaluate(df, X, out_dir=OUTPUT_DIR):
+def run_clustering_and_evaluate(df, X, out_dir=OUTPUT_DIR, skip_kmeans=False, skip_agglomerative=False, skip_dbscan=False, aggl_sample_size=5000):
     """Aplica varios algoritmos de clustering sobre X y guarda métricas y etiquetas.
 
     Parámetros:
@@ -332,46 +352,87 @@ def run_clustering_and_evaluate(df, X, out_dir=OUTPUT_DIR):
     logging.info('Explained variance ratio (first 5): %s', pca.explained_variance_ratio_[:5].tolist())
 
     # ---------------- KMEANS (barrido de k) ----------------
-    for k in range(2, 11):
-        # Crear modelo KMeans con semilla fija para reproducibilidad
-        km = KMeans(n_clusters=k, random_state=42, n_init=10)
-        # Ajustar sobre las primeras 5 componentes PCA (reduce ruido)
-        labels = km.fit_predict(Xp[:, :5])
-        # Métricas internas
-        sil = silhouette_score(Xp[:, :5], labels)
-        db = davies_bouldin_score(Xp[:, :5], labels)
-        # Pureza externa usando primary_genre y score_category
-        pur_gen = cluster_purity(df['primary_genre'].fillna('NA'), labels)
-        pur_score = cluster_purity(df['score_category'].astype(str).replace('nan','NA'), labels)
-        results.append({'method':'kmeans','params':f'k={k}','silhouette':sil,'db':db,'pur_genre':pur_gen,'pur_score':pur_score})
-        # Guardar etiquetas por anime para análisis posterior
-        out_labels = pd.DataFrame({'animeID': df.get('animeID', df.index), 'label': labels})
-        out_labels.to_csv(os.path.join(out_dir, f'labels_kmeans_k{k}.csv'), index=False)
-        logging.info('KMeans k=%d done: silhouette=%.4f purity_genre=%.4f', k, sil, pur_gen)
-
-    # ---------------- AGGLOMERATIVE (jerárquico) ----------------
-    for linkage in ['ward','average','complete']:
-        for k in range(2,9):
-            # Ward requires distancia euclidiana; comprobación rápida (aunque en la práctica no hacemos más validaciones aquí)
-            if linkage == 'ward' and Xp.shape[1] < 1:
-                continue
-            ac = AgglomerativeClustering(n_clusters=k, linkage=linkage)
-            labels = ac.fit_predict(Xp[:, :5])
+    if skip_kmeans:
+        logging.info('Skipping KMeans because skip_kmeans=True')
+    else:
+        for k in range(2, 11):
+            # Crear modelo KMeans con semilla fija para reproducibilidad
+            t0 = time.time()
+            km = KMeans(n_clusters=k, random_state=42, n_init=10)
+            # Ajustar sobre las primeras 5 componentes PCA (reduce ruido)
+            labels = km.fit_predict(Xp[:, :5])
+            # Métricas internas
             sil = silhouette_score(Xp[:, :5], labels)
             db = davies_bouldin_score(Xp[:, :5], labels)
+            t1 = time.time()
+            logging.info('KMeans k=%d done: silhouette=%.4f purity_genre=%.4f (%.1fs)', k, sil, cluster_purity(df['primary_genre'].fillna('NA'), labels), t1 - t0)
+            # Pureza externa usando primary_genre y score_category
             pur_gen = cluster_purity(df['primary_genre'].fillna('NA'), labels)
             pur_score = cluster_purity(df['score_category'].astype(str).replace('nan','NA'), labels)
-            results.append({'method':'agglomerative','params':f'link={linkage},k={k}','silhouette':sil,'db':db,'pur_genre':pur_gen,'pur_score':pur_score})
+            results.append({'method':'kmeans','params':f'k={k}','silhouette':sil,'db':db,'pur_genre':pur_gen,'pur_score':pur_score, 'time_s': t1-t0})
+            # Guardar etiquetas por anime para análisis posterior
             out_labels = pd.DataFrame({'animeID': df.get('animeID', df.index), 'label': labels})
-            out_labels.to_csv(os.path.join(out_dir, f'labels_aggl_{linkage}_k{k}.csv'), index=False)
+            out_labels.to_csv(os.path.join(out_dir, f'labels_kmeans_k{k}.csv'), index=False)
+
+    # ---------------- AGGLOMERATIVE (jerárquico) ----------------
+    # AGGLOMERATIVE: esta sección puede ser muy costosa en tiempo y memoria para >~6000 puntos.
+    if not skip_agglomerative:
+        for linkage in ['ward','average','complete']:
+            for k in range(2,9):
+                if linkage == 'ward' and Xp.shape[1] < 1:
+                    continue
+                try:
+                    n_samples = Xp.shape[0]
+                    # Si el dataset es grande, trabajamos sobre una muestra aleatoria para evitar OOM/CPU
+                    if n_samples > aggl_sample_size:
+                        idx = np.random.choice(n_samples, size=aggl_sample_size, replace=False)
+                        Xp_sub = Xp[idx, :5]
+                        t0 = time.time()
+                        ac = AgglomerativeClustering(n_clusters=k, linkage=linkage)
+                        labels_sub = ac.fit_predict(Xp_sub)
+                        t1 = time.time()
+                        sil = silhouette_score(Xp_sub, labels_sub)
+                        db = davies_bouldin_score(Xp_sub, labels_sub)
+                        pur_gen = cluster_purity(df.iloc[idx]['primary_genre'].fillna('NA'), labels_sub)
+                        pur_score = cluster_purity(df.iloc[idx]['score_category'].astype(str).replace('nan','NA'), labels_sub)
+                        results.append({'method':'agglomerative_sampled','params':f'link={linkage},k={k},sample={aggl_sample_size}','silhouette':sil,'db':db,'pur_genre':pur_gen,'pur_score':pur_score, 'time_s': t1-t0})
+                        # Guardar etiquetas sólo para la muestra
+                        out_labels = pd.DataFrame({'animeID': df.iloc[idx].get('animeID', df.iloc[idx].index), 'label': labels_sub})
+                        out_labels.to_csv(os.path.join(out_dir, f'labels_aggl_{linkage}_k{k}_sample{aggl_sample_size}.csv'), index=False)
+                        logging.info('Agglomerative (sample) link=%s k=%d done: silhouette=%.4f purity_genre=%.4f (%.1fs)', linkage, k, sil, pur_gen, t1-t0)
+                    else:
+                        t0 = time.time()
+                        ac = AgglomerativeClustering(n_clusters=k, linkage=linkage)
+                        labels = ac.fit_predict(Xp[:, :5])
+                        t1 = time.time()
+                        sil = silhouette_score(Xp[:, :5], labels)
+                        db = davies_bouldin_score(Xp[:, :5], labels)
+                        pur_gen = cluster_purity(df['primary_genre'].fillna('NA'), labels)
+                        pur_score = cluster_purity(df['score_category'].astype(str).replace('nan','NA'), labels)
+                        results.append({'method':'agglomerative','params':f'link={linkage},k={k}','silhouette':sil,'db':db,'pur_genre':pur_gen,'pur_score':pur_score, 'time_s': t1-t0})
+                        out_labels = pd.DataFrame({'animeID': df.get('animeID', df.index), 'label': labels})
+                        out_labels.to_csv(os.path.join(out_dir, f'labels_aggl_{linkage}_k{k}.csv'), index=False)
+                        logging.info('Agglomerative link=%s k=%d done: silhouette=%.4f purity_genre=%.4f (%.1fs)', linkage, k, sil, pur_gen, t1-t0)
+                except Exception as e:
+                    logging.warning('Agglomerative link=%s k=%d failed: %s', linkage, k, e)
+                    continue
 
     # ---------------- DBSCAN (densidad) ----------------
-    eps_list = [0.3, 0.5, 0.7, 1.0]
-    min_samples_list = [3,5,7]
+    eps_list = [0.5, 0.7]
+    min_samples_list = [5,7]
     for eps in eps_list:
         for ms in min_samples_list:
-            dbs = DBSCAN(eps=eps, min_samples=ms)
-            labels = dbs.fit_predict(Xp[:, :5])
+            if skip_dbscan:
+                logging.info('Skipping DBSCAN eps=%s ms=%d because skip_dbscan=True', eps, ms)
+                continue
+            try:
+                t0 = time.time()
+                dbs = DBSCAN(eps=eps, min_samples=ms)
+                labels = dbs.fit_predict(Xp[:, :5])
+                t1 = time.time()
+            except Exception as e:
+                logging.warning('DBSCAN eps=%.2f ms=%d failed: %s', eps, ms, e)
+                continue
             # Calcular número de clusters (ignorando etiqueta -1 = ruido)
             n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
             # Si no hay clusters válidos, saltar métricas que no tienen sentido
@@ -382,9 +443,10 @@ def run_clustering_and_evaluate(df, X, out_dir=OUTPUT_DIR):
             db = davies_bouldin_score(Xp[:, :5], labels)
             pur_gen = cluster_purity(df['primary_genre'].fillna('NA'), labels)
             pur_score = cluster_purity(df['score_category'].astype(str).replace('nan','NA'), labels)
-            results.append({'method':'dbscan','params':f'eps={eps},min_samples={ms}','silhouette':sil,'db':db,'pur_genre':pur_gen,'pur_score':pur_score})
+            results.append({'method':'dbscan','params':f'eps={eps},min_samples={ms}','silhouette':sil,'db':db,'pur_genre':pur_gen,'pur_score':pur_score, 'time_s': t1-t0})
             out_labels = pd.DataFrame({'animeID': df.get('animeID', df.index), 'label': labels})
             out_labels.to_csv(os.path.join(out_dir, f'labels_dbscan_eps{eps}_ms{ms}.csv'), index=False)
+            logging.info('DBSCAN eps=%.2f ms=%d done: silhouette=%.4f purity_genre=%.4f (%.1fs)', eps, ms, sil, pur_gen, t1-t0)
 
     # Guardar resultados en un CSV para análisis posterior
     results_df = pd.DataFrame(results)
@@ -403,12 +465,15 @@ def main(args):
     logging.info('Saved merged_raw.csv')
 
     # Preprocesar y obtener la matriz de features
-    df, X = preprocess_and_features(merged)
+    df, X = preprocess_and_features(merged, tfidf_max_features=args.tfidf_features)
     df.to_csv(os.path.join(OUTPUT_DIR, 'merged_data.csv'), index=False)
     logging.info('Saved merged_data.csv; features shape: %s', X.shape)
 
     # Ejecutar clustering y evaluación
-    results_df = run_clustering_and_evaluate(df, X)
+    results_df = run_clustering_and_evaluate(df, X,
+                                            skip_agglomerative=args.skip_agglomerative,
+                                            skip_dbscan=args.skip_dbscan,
+                                            aggl_sample_size=args.aggl_sample_size)
     logging.info('Clustering complete. Results saved in %s', OUTPUT_DIR)
 
 
@@ -418,5 +483,9 @@ if __name__ == '__main__':
     parser.add_argument('--animes', default='animes.csv', help='Ruta a animes.csv')
     parser.add_argument('--dataset', default='dataset_completo.csv', help='Ruta a dataset_completo.csv')
     parser.add_argument('--ratings', default='ratings.csv', help='Ruta a ratings.csv (puede ser grande)')
+    parser.add_argument('--skip-agglomerative', dest='skip_agglomerative', action='store_true', help='No ejecutar Agglomerative (muy costoso)')
+    parser.add_argument('--skip-dbscan', dest='skip_dbscan', action='store_true', help='No ejecutar DBSCAN (costoso)')
+    parser.add_argument('--aggl-sample-size', dest='aggl_sample_size', type=int, default=5000, help='Si Agglomerative > sample_size, ejecutar sobre muestra aleatoria de este tamaño')
+    parser.add_argument('--tfidf-features', dest='tfidf_features', type=int, default=0, help='Número de features TF-IDF desde sinopsis (0 desactiva)')
     args = parser.parse_args()
     main(args)
